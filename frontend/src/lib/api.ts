@@ -1,8 +1,8 @@
 import axios from 'axios'
 import type { Customer, Part, Invoice, CreateInvoiceData } from '@/types'
 
-// Empty string = relative URLs → nginx proxies /api to backend. Non-empty = direct URL for local dev.
-const API_URL = import.meta.env.VITE_API_URL ?? ''
+// Most reliable fallback for Docker/local development.
+const API_URL = import.meta.env.VITE_API_URL ?? 'http://127.0.0.1:8000'
 
 export const api = axios.create({
   baseURL: API_URL,
