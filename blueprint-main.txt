@@ -1,0 +1,464 @@
+==============================================================================
+  JAGANNATH ENTERPRISES - INVOICE SYSTEM
+  Deployment Blueprint: Docker (Local) → Kubernetes EKS (Helm)
+==============================================================================
+
+ARCHITECTURE
+────────────
+  Browser
+    │
+    ▼
+  [invoice-frontend]  nginx:80   → serves React SPA
+    │  nginx proxies /api/* to backend (same network / K8s service DNS)
+    ▼
+  [invoice-backend]   uvicorn:8000  → FastAPI
+    │
+    ▼
+  [invoice-postgres]  postgres:5432 → PostgreSQL (container / K8s pod)
+
+  Key rule: nginx.conf proxies /api → http://invoice-backend:8000
+  This name MUST match:
+    Docker  → container --name invoice-backend
+    K8s     → Helm Service metadata.name: invoice-backend
+
+==============================================================================
+  PART 1 — LOCAL DOCKER (individual containers, no docker-compose)
+==============================================================================
+
+PREREQUISITES
+  - Docker Desktop running
+
+─────────────────────────────────────────────────────────────────────────────
+STEP 1 — Build images
+─────────────────────────────────────────────────────────────────────────────
+
+  cd backend
+  docker build -t invoice-backend:latest .
+  cd ../frontend
+  docker build -t invoice-frontend:latest .
+  cd ..
+
+─────────────────────────────────────────────────────────────────────────────
+STEP 2 — Create shared Docker network
+─────────────────────────────────────────────────────────────────────────────
+
+  docker network create invoice-network
+
+─────────────────────────────────────────────────────────────────────────────
+STEP 3 — Start PostgreSQL
+─────────────────────────────────────────────────────────────────────────────
+
+  docker run -d \
+    --name invoice-postgres \
+    --network invoice-network \
+    -e POSTGRES_USER=postgres \
+    -e POSTGRES_PASSWORD=postgres \
+    -e POSTGRES_DB=invoice_db \
+    -v invoice-pgdata:/var/lib/postgresql/data \
+    -p 5432:5432 \
+    postgres:15-alpine
+
+  # Wait ~10 seconds for Postgres to be ready
+
+─────────────────────────────────────────────────────────────────────────────
+STEP 4 — Start backend
+─────────────────────────────────────────────────────────────────────────────
+
+  # --name MUST be invoice-backend (nginx.conf resolves it by this name)
+
+  docker run -d \
+    --name invoice-backend \
+    --network invoice-network \
+    -e DATABASE_URL=postgresql://postgres:postgres@invoice-postgres:5432/invoice_db \
+    -e SECRET_KEY=change-this-in-production \
+    -e CORS_ORIGINS=http://localhost:3000 \
+    -e DEBUG=False \
+    -p 8000:8000 \
+    invoice-backend:latest
+
+  # Wait ~5 seconds, then seed sample data (first run only)
+  docker exec invoice-backend python3 -m app.seed_data
+
+  # Verify
+  curl http://localhost:8000/health
+  # → {"status":"healthy","service":"Jagannath Enterprises Invoice System"}
+
+─────────────────────────────────────────────────────────────────────────────
+STEP 5 — Start frontend
+─────────────────────────────────────────────────────────────────────────────
+
+  docker run -d \
+    --name invoice-frontend \
+    --network invoice-network \
+    -p 3000:80 \
+    invoice-frontend:latest
+
+─────────────────────────────────────────────────────────────────────────────
+STEP 6 — Verify
+─────────────────────────────────────────────────────────────────────────────
+
+  docker ps
+  # All 3 containers must show "Up"
+
+  Browser  → http://localhost:3000
+  API docs → http://localhost:8000/docs
+
+─────────────────────────────────────────────────────────────────────────────
+STEP 7 — Tear down
+─────────────────────────────────────────────────────────────────────────────
+
+  docker rm -f invoice-frontend invoice-backend invoice-postgres
+  docker network rm invoice-network
+  docker volume rm invoice-pgdata   # removes DB data too
+
+==============================================================================
+  PART 2 — AWS EKS DEPLOYMENT WITH HELM
+==============================================================================
+
+PREREQUISITES
+  - Docker Desktop
+  - AWS CLI configured  (aws configure)
+  - kubectl pointing at your EKS cluster
+  - Helm 3  (brew install helm)
+  - Docker Hub account
+  - EKS cluster running  (eksctl or Terraform)
+
+─────────────────────────────────────────────────────────────────────────────
+STEP 1 — Push images to Docker Hub
+─────────────────────────────────────────────────────────────────────────────
+
+  DOCKERHUB_USER=your-dockerhub-username   # replace this
+
+  docker login
+
+  # Backend
+  docker build -t $DOCKERHUB_USER/invoice-backend:latest ./backend
+  docker push $DOCKERHUB_USER/invoice-backend:latest
+
+  # Frontend
+  docker build -t $DOCKERHUB_USER/invoice-frontend:latest ./frontend
+  docker push $DOCKERHUB_USER/invoice-frontend:latest
+
+─────────────────────────────────────────────────────────────────────────────
+STEP 2 — Create Helm chart scaffold
+─────────────────────────────────────────────────────────────────────────────
+
+  helm create invoice-app
+  rm -rf invoice-app/templates/*   # delete default templates
+
+─────────────────────────────────────────────────────────────────────────────
+STEP 3 — Helm chart file structure to create
+─────────────────────────────────────────────────────────────────────────────
+
+  invoice-app/
+  ├── Chart.yaml
+  ├── values.yaml
+  └── templates/
+      ├── namespace.yaml
+      ├── secret.yaml
+      ├── postgres-statefulset.yaml
+      ├── postgres-service.yaml
+      ├── backend-deployment.yaml
+      ├── backend-service.yaml
+      ├── frontend-deployment.yaml
+      ├── frontend-service.yaml
+      └── ingress.yaml
+
+─────────────────────────────────────────────────────────────────────────────
+STEP 4 — values.yaml (minimum required keys)
+─────────────────────────────────────────────────────────────────────────────
+
+  namespace: invoice-app
+
+  image:
+    username: your-dockerhub-username   # Docker Hub username
+    backendTag: latest
+    frontendTag: latest
+
+  backend:
+    replicaCount: 1
+    secretKey: "change-this-in-production"
+    corsOrigins: "https://invoice.vihan.online"
+    debug: "False"
+
+  frontend:
+    replicaCount: 1
+
+  postgres:
+    user: postgres
+    password: postgres          # override in my-values.yaml
+    database: invoice_db
+    storage: 5Gi
+
+  ingress:
+    enabled: true
+    frontendHost: invoice.vihan.online
+    backendHost: backend.vihan.online
+    annotations:
+      kubernetes.io/ingress.class: alb
+      alb.ingress.kubernetes.io/scheme: internet-facing
+      alb.ingress.kubernetes.io/target-type: ip
+
+─────────────────────────────────────────────────────────────────────────────
+STEP 5 — What each template must contain
+─────────────────────────────────────────────────────────────────────────────
+
+  namespace.yaml
+    apiVersion: v1 / Kind: Namespace
+    name: {{ .Values.namespace }}
+
+  secret.yaml
+    apiVersion: v1 / Kind: Secret / type: Opaque
+    Keys (base64 encoded):
+      database-url   → postgresql://{{ postgres.user }}:{{ postgres.password }}
+                        @invoice-postgres:5432/{{ postgres.database }}
+      postgres-password → {{ postgres.password }}
+      secret-key        → {{ backend.secretKey }}
+
+  postgres-statefulset.yaml
+    Kind: StatefulSet  (replicas: 1)
+    image: postgres:15-alpine
+    env:
+      POSTGRES_USER     → .Values.postgres.user
+      POSTGRES_PASSWORD → secretKeyRef: invoice-secrets / postgres-password
+      POSTGRES_DB       → .Values.postgres.database
+      PGDATA            → /var/lib/postgresql/data/pgdata
+    volumeMounts: /var/lib/postgresql/data
+    volumeClaimTemplates: ReadWriteOnce, storage: .Values.postgres.storage
+    readinessProbe: exec pg_isready -U postgres
+
+  postgres-service.yaml
+    Kind: Service  (ClusterIP: None — headless for StatefulSet)
+    name: invoice-postgres          ← DATABASE_URL resolves this
+    port: 5432
+
+  backend-deployment.yaml
+    Kind: Deployment
+    image: docker.io/{{ .Values.image.username }}/invoice-backend:{{ .Values.image.backendTag }}
+    initContainer: wait for postgres (pg_isready -h invoice-postgres)
+    env:
+      DATABASE_URL → secretKeyRef: invoice-secrets / database-url
+      SECRET_KEY   → secretKeyRef: invoice-secrets / secret-key
+      CORS_ORIGINS → .Values.backend.corsOrigins
+      DEBUG        → .Values.backend.debug
+    readinessProbe: httpGet /health :8000
+    livenessProbe:  httpGet /health :8000
+
+  backend-service.yaml
+    Kind: Service  (ClusterIP)
+    name: invoice-backend           ← nginx.conf proxy_pass resolves this
+    port: 8000
+
+  frontend-deployment.yaml
+    Kind: Deployment
+    image: docker.io/{{ .Values.image.username }}/invoice-frontend:{{ .Values.image.frontendTag }}
+    readinessProbe: httpGet / :80
+    livenessProbe:  httpGet / :80
+
+  frontend-service.yaml
+    Kind: Service  (ClusterIP)
+    name: invoice-frontend
+    port: 80
+
+  ingress.yaml
+    {{- if .Values.ingress.enabled }}
+    Kind: Ingress
+    annotations: {{ toYaml .Values.ingress.annotations }}
+    rules:
+      - host: invoice.vihan.online   (.Values.ingress.frontendHost)
+        path: /  → service: invoice-frontend:80
+      - host: backend.vihan.online   (.Values.ingress.backendHost)
+        path: /  → service: invoice-backend:8000
+    {{- end }}
+
+    NOTE: backend.vihan.online exposes the API directly (e.g. /docs).
+    invoice.vihan.online is the React app — nginx still proxies /api
+    internally so the app works even without the backend ingress rule.
+
+─────────────────────────────────────────────────────────────────────────────
+STEP 6 — Secrets strategy (K8s native + GitHub Actions — no AWS Secrets Manager)
+─────────────────────────────────────────────────────────────────────────────
+
+  A) Store secrets in GitHub repo → Settings → Secrets and variables → Actions
+     Add these secrets:
+       DOCKERHUB_USERNAME
+       DOCKERHUB_TOKEN
+       DB_PASSWORD          (postgres password)
+       BACKEND_SECRET_KEY   (random string)
+
+  B) GitHub Actions workflow reads those secrets and passes them to
+     helm upgrade via --set flags at deploy time (see STEP 10).
+     Sensitive values are NEVER stored in values.yaml or my-values.yaml.
+
+  C) Inside the cluster, Helm renders them into a K8s Secret (invoice-secrets).
+     Pods read from that K8s Secret via secretKeyRef — not from env files.
+
+─────────────────────────────────────────────────────────────────────────────
+STEP 7 — Override file for non-sensitive config only (safe to commit)
+─────────────────────────────────────────────────────────────────────────────
+
+  # my-values.yaml — no passwords or secret keys here
+  image:
+    username: your-dockerhub-username
+    backendTag: latest
+    frontendTag: latest
+  backend:
+    corsOrigins: "https://invoice.vihan.online"
+    debug: "False"
+  ingress:
+    frontendHost: invoice.vihan.online
+    backendHost: backend.vihan.online
+
+─────────────────────────────────────────────────────────────────────────────
+STEP 8 — Connect kubectl to EKS
+─────────────────────────────────────────────────────────────────────────────
+
+  aws eks update-kubeconfig --region <your-region> --name <your-cluster-name>
+  kubectl get nodes   # verify cluster is reachable
+
+─────────────────────────────────────────────────────────────────────────────
+STEP 9 — Lint and dry-run before deploying
+─────────────────────────────────────────────────────────────────────────────
+
+  helm lint ./invoice-app
+  helm template invoice-app ./invoice-app -f my-values.yaml   # inspect rendered YAML
+
+─────────────────────────────────────────────────────────────────────────────
+STEP 10 — Deploy (secrets passed via --set, never stored in files)
+─────────────────────────────────────────────────────────────────────────────
+
+  # Manually (or in GitHub Actions, replace values with ${{ secrets.* }})
+  helm upgrade --install invoice-app ./invoice-app \
+    -f my-values.yaml \
+    --set postgres.password="strong-db-password" \
+    --set backend.secretKey="strong-random-secret-key" \
+    --namespace invoice-app \
+    --create-namespace
+
+  # Watch pods come up
+  kubectl get pods -n invoice-app -w
+
+  # Once all pods are Running, seed the database (first deploy only)
+  BACKEND_POD=$(kubectl get pod -n invoice-app -l app=invoice-backend \
+    -o jsonpath='{.items[0].metadata.name}')
+  kubectl exec -n invoice-app $BACKEND_POD -- python3 -m app.seed_data
+
+  # Check services and ingress
+  kubectl get svc -n invoice-app
+  kubectl get ingress -n invoice-app
+
+─────────────────────────────────────────────────────────────────────────────
+STEP 11 — GitHub Actions CI/CD workflow (recommended)
+─────────────────────────────────────────────────────────────────────────────
+
+  # .github/workflows/deploy.yml  (create this file yourself)
+  # Trigger: push to main branch
+  #
+  # Jobs:
+  #   1. build-push:
+  #        - docker login using ${{ secrets.DOCKERHUB_USERNAME }} / DOCKERHUB_TOKEN
+  #        - docker build + push backend and frontend with tag ${{ github.sha }}
+  #
+  #   2. deploy:
+  #        - aws eks update-kubeconfig ...
+  #        - helm upgrade --install invoice-app ./invoice-app \
+  #            -f my-values.yaml \
+  #            --set image.backendTag=${{ github.sha }} \
+  #            --set image.frontendTag=${{ github.sha }} \
+  #            --set postgres.password=${{ secrets.DB_PASSWORD }} \
+  #            --set backend.secretKey=${{ secrets.BACKEND_SECRET_KEY }} \
+  #            --namespace invoice-app --create-namespace
+
+─────────────────────────────────────────────────────────────────────────────
+STEP 12 — Upgrade after code changes (manual)
+─────────────────────────────────────────────────────────────────────────────
+
+  GIT_SHA=$(git rev-parse --short HEAD)
+  DOCKERHUB_USER=your-dockerhub-username
+
+  docker build -t $DOCKERHUB_USER/invoice-backend:$GIT_SHA ./backend
+  docker push $DOCKERHUB_USER/invoice-backend:$GIT_SHA
+
+  docker build -t $DOCKERHUB_USER/invoice-frontend:$GIT_SHA ./frontend
+  docker push $DOCKERHUB_USER/invoice-frontend:$GIT_SHA
+
+  helm upgrade invoice-app ./invoice-app \
+    -f my-values.yaml \
+    --set image.backendTag=$GIT_SHA \
+    --set image.frontendTag=$GIT_SHA \
+    --set postgres.password="strong-db-password" \
+    --set backend.secretKey="strong-random-secret-key" \
+    --namespace invoice-app
+
+─────────────────────────────────────────────────────────────────────────────
+STEP 13 — Rollback
+─────────────────────────────────────────────────────────────────────────────
+
+  helm history invoice-app -n invoice-app        # list revisions
+  helm rollback invoice-app <revision> -n invoice-app
+
+==============================================================================
+  CONNECTION REFERENCE
+==============================================================================
+
+  DOCKER LOCAL
+    Browser → http://localhost:3000 (invoice-frontend container)
+    nginx /api/* → http://invoice-backend:8000  [Docker network DNS]
+    Backend → postgresql://postgres@invoice-postgres:5432/invoice_db
+
+  EKS
+    invoice.vihan.online  → ALB ingress → invoice-frontend Service:80
+    backend.vihan.online  → ALB ingress → invoice-backend Service:8000
+    nginx /api/* → http://invoice-backend:8000  [K8s ClusterIP DNS]
+    Backend → postgresql://postgres@invoice-postgres:5432/invoice_db
+              [invoice-postgres is a headless K8s Service for the StatefulSet]
+
+  SECRETS FLOW
+    GitHub Actions secrets
+      → passed to helm upgrade via --set
+        → rendered into K8s Secret (invoice-secrets)
+          → injected into pods via secretKeyRef (never in env files)
+
+  CRITICAL NAMING RULES (must never change):
+    invoice-backend  → Docker container name AND K8s Service name
+                       (nginx.conf proxy_pass http://invoice-backend:8000)
+    invoice-postgres → Docker container name AND K8s Service name
+                       (DATABASE_URL host)
+
+  BACKEND ENV VARS:
+    DATABASE_URL   = postgresql://user:pass@invoice-postgres:5432/invoice_db
+    SECRET_KEY     = strong random string
+    CORS_ORIGINS   = https://your-domain.com
+    DEBUG          = False
+
+  FRONTEND:
+    No runtime env vars needed.
+    VITE_API_URL is unset at build → api.ts uses "" → relative /api/* calls
+    → nginx proxies those to invoice-backend.
+
+==============================================================================
+  REPO FILES OVERVIEW
+==============================================================================
+
+  invoice-generate-app/
+  ├── blueprint.txt                   ← this file
+  ├── README.md
+  ├── backend/
+  │   ├── Dockerfile
+  │   ├── .dockerignore
+  │   ├── .env.example
+  │   ├── requirements.txt
+  │   └── app/
+  ├── frontend/
+  │   ├── Dockerfile
+  │   ├── .dockerignore
+  │   ├── .env.example
+  │   ├── nginx.conf                  ← proxy_pass http://invoice-backend:8000
+  │   ├── package.json
+  │   └── src/lib/api.ts              ← VITE_API_URL ?? "" (relative URLs)
+  └── invoice-app/                    ← Helm chart (you create this)
+      ├── Chart.yaml
+      ├── values.yaml
+      └── templates/
+
+==============================================================================
