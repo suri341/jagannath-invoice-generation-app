@@ -1,0 +1,319 @@
+==============================================================================
+  JAGANNATH ENTERPRISES - INVOICE SYSTEM
+  Deployment Blueprint: Docker (Local) → Kubernetes EKS (Helm)
+==============================================================================
+
+ARCHITECTURE OVERVIEW
+─────────────────────
+  Browser
+    │
+    ▼
+  [invoice-frontend]  nginx:80  → serves React SPA
+    │  nginx proxies /api/* internally
+    ▼
+  [invoice-backend]   uvicorn:8000  → FastAPI
+    │
+    ▼
+  [invoice-postgres]  postgres:5432 → PostgreSQL
+
+  Key design: nginx proxies /api requests from frontend to backend on
+  the same Docker network (or K8s service). The browser never makes
+  cross-origin requests to the backend directly → no CORS issues.
+  Container name "invoice-backend" is used in nginx.conf and must match
+  the Docker container name OR the Helm service name in K8s.
+
+==============================================================================
+  SECTION 1 — LOCAL DOCKER DEPLOYMENT (no docker-compose)
+==============================================================================
+
+Prerequisites
+─────────────
+  - Docker Desktop running
+  - PostgreSQL NOT required locally (runs as a container)
+
+STEP 1: Build images
+────────────────────
+
+  # Build backend image
+  cd backend
+  docker build -t invoice-backend:latest .
+  cd ..
+
+  # Build frontend image (VITE_API_URL is intentionally NOT set here;
+  # nginx.conf proxies /api to invoice-backend container on the network)
+  cd frontend
+  docker build -t invoice-frontend:latest .
+  cd ..
+
+STEP 2: Create a Docker network
+────────────────────────────────
+
+  docker network create invoice-network
+
+STEP 3: Start PostgreSQL container
+────────────────────────────────────
+  (Skip if you want to use your local Mac PostgreSQL — see note below)
+
+  docker run -d \
+    --name invoice-postgres \
+    --network invoice-network \
+    -e POSTGRES_USER=postgres \
+    -e POSTGRES_PASSWORD=postgres \
+    -e POSTGRES_DB=invoice_db \
+    -v invoice-pgdata:/var/lib/postgresql/data \
+    -p 5432:5432 \
+    postgres:15-alpine
+
+  Wait ~10 seconds for Postgres to be ready.
+
+  NOTE — if you prefer your local Mac PostgreSQL instead of a container:
+    - Skip this step
+    - In STEP 4 use DATABASE_URL=postgresql://postgres:postgres@host.docker.internal:5432/invoice_db
+    - Make sure invoice_db database exists: psql -c "CREATE DATABASE invoice_db;"
+
+STEP 4: Start backend container
+─────────────────────────────────
+  # Container MUST be named "invoice-backend" — nginx.conf uses this hostname
+
+  docker run -d \
+    --name invoice-backend \
+    --network invoice-network \
+    -e DATABASE_URL=postgresql://postgres:postgres@invoice-postgres:5432/invoice_db \
+    -e SECRET_KEY=change-this-in-production \
+    -e CORS_ORIGINS=http://localhost:3000 \
+    -e DEBUG=False \
+    -p 8000:8000 \
+    invoice-backend:latest
+
+  Wait ~5 seconds for the app to start, then seed the database:
+
+  docker exec invoice-backend python3 -m app.seed_data
+
+  Verify backend is up:
+  curl http://localhost:8000/health
+  # Expected: {"status":"healthy","service":"Jagannath Enterprises Invoice System"}
+
+STEP 5: Start frontend container
+──────────────────────────────────
+
+  docker run -d \
+    --name invoice-frontend \
+    --network invoice-network \
+    -p 3000:80 \
+    invoice-frontend:latest
+
+STEP 6: Verify everything is running
+──────────────────────────────────────
+
+  docker ps
+  # Should show 3 containers: invoice-postgres, invoice-backend, invoice-frontend
+  # All should show "Up" (backend may show "health: starting" briefly)
+
+  Open browser: http://localhost:3000
+  API docs:     http://localhost:8000/docs
+
+STEP 7: Stop and clean up
+───────────────────────────
+
+  docker rm -f invoice-frontend invoice-backend invoice-postgres
+  docker network rm invoice-network
+  # To also remove the Postgres data volume:
+  docker volume rm invoice-pgdata
+
+==============================================================================
+  SECTION 2 — AWS EKS DEPLOYMENT WITH HELM
+==============================================================================
+
+Prerequisites
+─────────────
+  - AWS CLI configured (aws configure)
+  - kubectl installed and configured for your EKS cluster
+  - Helm 3 installed
+  - An ECR registry or Docker Hub account
+  - An EKS cluster running (eksctl or Terraform)
+  - An AWS RDS PostgreSQL instance OR PostgreSQL in-cluster
+
+STEP 1: Push images to ECR
+────────────────────────────
+
+  AWS_ACCOUNT=<your-aws-account-id>
+  AWS_REGION=<your-region>              # e.g. ap-south-1
+  ECR_REPO=$AWS_ACCOUNT.dkr.ecr.$AWS_REGION.amazonaws.com
+
+  # Authenticate
+  aws ecr get-login-password --region $AWS_REGION \
+    | docker login --username AWS --password-stdin $ECR_REPO
+
+  # Create ECR repositories (first time only)
+  aws ecr create-repository --repository-name invoice-backend --region $AWS_REGION
+  aws ecr create-repository --repository-name invoice-frontend --region $AWS_REGION
+
+  # Tag and push backend
+  docker tag invoice-backend:latest $ECR_REPO/invoice-backend:latest
+  docker push $ECR_REPO/invoice-backend:latest
+
+  # Tag and push frontend
+  docker tag invoice-frontend:latest $ECR_REPO/invoice-frontend:latest
+  docker push $ECR_REPO/invoice-frontend:latest
+
+STEP 2: Create Helm chart
+───────────────────────────
+
+  # In your repo root, create the Helm chart:
+  helm create invoice-app
+
+  # Delete the generated templates (replace with your own):
+  rm -rf invoice-app/templates/*
+
+  # Create the following files inside invoice-app/templates/:
+  #
+  #   namespace.yaml         — Kubernetes Namespace
+  #   secret.yaml            — DB password and SECRET_KEY as K8s Secret
+  #   backend-deployment.yaml — Deployment for FastAPI (image: invoice-backend)
+  #   backend-service.yaml   — ClusterIP Service named "invoice-backend" (port 8000)
+  #                            (IMPORTANT: must match the nginx.conf proxy_pass hostname)
+  #   frontend-deployment.yaml — Deployment for nginx (image: invoice-frontend)
+  #   frontend-service.yaml  — Service for frontend (port 80)
+  #   ingress.yaml           — ALB Ingress (if using AWS Load Balancer Controller)
+  #                            routes /* to frontend service
+  #
+  # invoice-app/values.yaml example keys:
+  #   namespace: invoice-app
+  #   image:
+  #     registry: <ecr-url>
+  #     backendTag: latest
+  #     frontendTag: latest
+  #   backend:
+  #     replicaCount: 2
+  #     databaseUrl: "postgresql://user:pass@rds-host:5432/invoice_db"
+  #     secretKey: "strong-secret-key"
+  #     corsOrigins: "https://your-domain.com"
+  #   frontend:
+  #     replicaCount: 2
+  #   ingress:
+  #     enabled: true
+  #     host: invoice.yourdomain.com
+  #     annotations:
+  #       kubernetes.io/ingress.class: alb
+  #       alb.ingress.kubernetes.io/scheme: internet-facing
+
+  NOTE: The backend K8s Service MUST be named "invoice-backend" in the
+  Helm template so nginx.conf (proxy_pass http://invoice-backend:8000)
+  resolves correctly inside the cluster.
+
+STEP 3: Configure values for EKS
+───────────────────────────────────
+
+  # Create an override file — never commit this file to git
+  cat > my-values.yaml <<EOF
+  image:
+    registry: $ECR_REPO
+    backendTag: latest
+    frontendTag: latest
+  backend:
+    databaseUrl: "postgresql://postgres:YOURPASSWORD@your-rds-host.rds.amazonaws.com:5432/invoice_db"
+    secretKey: "your-production-secret-key"
+    corsOrigins: "https://invoice.yourdomain.com"
+  ingress:
+    host: invoice.yourdomain.com
+  EOF
+
+STEP 4: Deploy with Helm
+─────────────────────────
+
+  # Set kubectl context to your EKS cluster
+  aws eks update-kubeconfig --region $AWS_REGION --name your-cluster-name
+
+  # Install / upgrade
+  helm upgrade --install invoice-app ./invoice-app \
+    -f my-values.yaml \
+    --namespace invoice-app \
+    --create-namespace
+
+  # Verify pods are running
+  kubectl get pods -n invoice-app
+  kubectl get svc -n invoice-app
+  kubectl get ingress -n invoice-app
+
+STEP 5: Seed database (first deploy only)
+──────────────────────────────────────────
+
+  # Find the backend pod name
+  BACKEND_POD=$(kubectl get pod -n invoice-app -l app=invoice-backend \
+    -o jsonpath='{.items[0].metadata.name}')
+
+  kubectl exec -n invoice-app $BACKEND_POD -- python3 -m app.seed_data
+
+STEP 6: Upgrade after code changes
+────────────────────────────────────
+
+  # Rebuild + push images with a new tag (use git SHA for traceability)
+  GIT_SHA=$(git rev-parse --short HEAD)
+
+  docker build -t $ECR_REPO/invoice-backend:$GIT_SHA ./backend
+  docker push $ECR_REPO/invoice-backend:$GIT_SHA
+
+  docker build -t $ECR_REPO/invoice-frontend:$GIT_SHA ./frontend
+  docker push $ECR_REPO/invoice-frontend:$GIT_SHA
+
+  helm upgrade invoice-app ./invoice-app \
+    -f my-values.yaml \
+    --set image.backendTag=$GIT_SHA \
+    --set image.frontendTag=$GIT_SHA \
+    --namespace invoice-app
+
+STEP 7: Rollback if needed
+────────────────────────────
+
+  helm rollback invoice-app 0 --namespace invoice-app
+  # 0 = previous release, or use `helm history invoice-app` to pick a revision
+
+==============================================================================
+  CONNECTION REFERENCE
+==============================================================================
+
+  DOCKER LOCAL:
+    Frontend → nginx (port 3000)
+    nginx /api/* → http://invoice-backend:8000  [Docker network DNS]
+    Backend → PostgreSQL at invoice-postgres:5432  [Docker network DNS]
+
+  EKS:
+    ALB Ingress → frontend-service:80
+    nginx /api/* → http://invoice-backend:8000  [K8s ClusterIP DNS]
+    Backend → RDS PostgreSQL (external)  [set via DATABASE_URL env var]
+
+  IMPORTANT ENV VARS:
+    Backend container:
+      DATABASE_URL   = postgresql://user:pass@host:5432/invoice_db
+      SECRET_KEY     = strong random string
+      CORS_ORIGINS   = comma-separated allowed origins
+      DEBUG          = False (production)
+
+    Frontend: no runtime env vars needed.
+      VITE_API_URL is intentionally left unset at Docker build time.
+      The empty string causes api.ts to use relative URLs (/api/...),
+      which nginx then proxies to the backend service.
+
+==============================================================================
+  FILES OVERVIEW
+==============================================================================
+
+  invoice-generate-app/
+  ├── blueprint.txt                   ← this file
+  ├── README.md
+  ├── backend/
+  │   ├── Dockerfile                  ← production image, curl healthcheck
+  │   ├── .dockerignore               ← excludes venv, .env, __pycache__
+  │   ├── .env.example                ← reference only, never commit .env
+  │   ├── requirements.txt
+  │   └── app/                        ← FastAPI application code
+  └── frontend/
+      ├── Dockerfile                  ← multi-stage build, nginx serving
+      ├── .dockerignore               ← excludes node_modules, .env, dist
+      ├── .env.example                ← reference only, never commit .env
+      ├── nginx.conf                  ← proxies /api to invoice-backend:8000
+      ├── package.json
+      └── src/                        ← React/TypeScript source
+          └── lib/api.ts              ← baseURL="" when VITE_API_URL unset
+
+==============================================================================
