@@ -1,0 +1,37 @@
+namespace: invoice-app
+
+image:
+  username: vihan341   # Docker Hub username
+  backendTag: v1
+  frontendTag: v1
+
+backend:
+  replicaCount: 1
+  secretKey: "change-this-in-production"
+  corsOrigins: "https://invoice.vihan.store,https://backend.vihan.store,http://localhost:3000,http://localhost:5173"
+  debug: "False"
+
+frontend:
+  replicaCount: 1
+
+postgres:
+  user: postgres
+  password: postgres
+  database: invoice_db
+  storage: 5Gi
+  storageClassName: gp3    # AWS EBS for EKS; use local-storage for local dev
+
+ingress:
+  enabled: true
+  frontendHost: invoice.vihan.store
+  backendHost: backend.vihan.store
+  certificateArn: "arn:aws:acm:ap-south-1:175864702507:certificate/REPLACE_WITH_REAL_CERT_ARN"
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80,"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: '443'
+awsLoadBalancerController:
+  enabled: true                    # Set to false if already installed
+  awsAccountId: "175864702507"  # Required for OIDC role assumption

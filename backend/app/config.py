@@ -3,9 +3,12 @@ from typing import List
 
 
 class Settings(BaseSettings):
-    DATABASE_URL: str = "postgresql://postgres:postgres@localhost:5432/invoice_db"
+    # Local dev default: postgres running on the machine or Docker host.
+    # For EKS + PostgreSQL StatefulSet, override this via env/secret:
+    # DATABASE_URL=postgresql://postgres:postgres@postgres:5432/invoice_db
+    DATABASE_URL: str = "postgresql://postgres:postgres@postgres:5432/invoice_db"
     SECRET_KEY: str = "your-secret-key-change-in-production"
-    CORS_ORIGINS: str = "http://localhost:3000,http://localhost:5173"
+    CORS_ORIGINS: str = "https://invoice.vihan.store,https://backend.vihan.store,http://localhost:3000,http://localhost:5173"
     DEBUG: bool = True
 
     # Company Information

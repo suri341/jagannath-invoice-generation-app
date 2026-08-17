@@ -132,12 +132,12 @@ STEP 1 — Push images to Docker Hub
   docker login
 
   # Backend
-  docker build -t $DOCKERHUB_USER/invoice-backend:latest ./backend
-  docker push $DOCKERHUB_USER/invoice-backend:latest
+  docker build --no-cache -t $DOCKERHUB_USER/invoice-backend:v1 ./backend
+  docker push $DOCKERHUB_USER/invoice-backend:v1
 
   # Frontend
-  docker build -t $DOCKERHUB_USER/invoice-frontend:latest ./frontend
-  docker push $DOCKERHUB_USER/invoice-frontend:latest
+  docker build --no-cache -t $DOCKERHUB_USER/invoice-frontend:v1 ./frontend
+  docker push $DOCKERHUB_USER/invoice-frontend:v1
 
 ─────────────────────────────────────────────────────────────────────────────
 STEP 2 — Create Helm chart scaffold
@@ -178,7 +178,7 @@ STEP 4 — values.yaml (minimum required keys)
   backend:
     replicaCount: 1
     secretKey: "change-this-in-production"
-    corsOrigins: "https://invoice.vihan.online"
+    corsOrigins: "https://invoice.vihan.store"
     debug: "False"
 
   frontend:
@@ -192,8 +192,8 @@ STEP 4 — values.yaml (minimum required keys)
 
   ingress:
     enabled: true
-    frontendHost: invoice.vihan.online
-    backendHost: backend.vihan.online
+    frontendHost: invoice.vihan.store
+    backendHost: backend.vihan.store
     annotations:
       kubernetes.io/ingress.class: alb
       alb.ingress.kubernetes.io/scheme: internet-facing
@@ -265,14 +265,14 @@ STEP 5 — What each template must contain
     Kind: Ingress
     annotations: {{ toYaml .Values.ingress.annotations }}
     rules:
-      - host: invoice.vihan.online   (.Values.ingress.frontendHost)
+      - host: invoice.vihan.store   (.Values.ingress.frontendHost)
         path: /  → service: invoice-frontend:80
-      - host: backend.vihan.online   (.Values.ingress.backendHost)
+      - host: backend.vihan.store   (.Values.ingress.backendHost)
         path: /  → service: invoice-backend:8000
     {{- end }}
 
-    NOTE: backend.vihan.online exposes the API directly (e.g. /docs).
-    invoice.vihan.online is the React app — nginx still proxies /api
+    NOTE: backend.vihan.store exposes the API directly (e.g. /docs).
+    invoice.vihan.store is the React app — nginx still proxies /api
     internally so the app works even without the backend ingress rule.
 
 ─────────────────────────────────────────────────────────────────────────────
@@ -303,11 +303,11 @@ STEP 7 — Override file for non-sensitive config only (safe to commit)
     backendTag: latest
     frontendTag: latest
   backend:
-    corsOrigins: "https://invoice.vihan.online"
+    corsOrigins: "https://invoice.vihan.store"
     debug: "False"
   ingress:
-    frontendHost: invoice.vihan.online
-    backendHost: backend.vihan.online
+    frontendHost: invoice.vihan.store
+    backendHost: backend.vihan.store
 
 ─────────────────────────────────────────────────────────────────────────────
 STEP 8 — Connect kubectl to EKS
@@ -407,8 +407,8 @@ STEP 13 — Rollback
     Backend → postgresql://postgres@invoice-postgres:5432/invoice_db
 
   EKS
-    invoice.vihan.online  → ALB ingress → invoice-frontend Service:80
-    backend.vihan.online  → ALB ingress → invoice-backend Service:8000
+    invoice.vihan.store  → ALB ingress → invoice-frontend Service:80
+    backend.vihan.store  → ALB ingress → invoice-backend Service:8000
     nginx /api/* → http://invoice-backend:8000  [K8s ClusterIP DNS]
     Backend → postgresql://postgres@invoice-postgres:5432/invoice_db
               [invoice-postgres is a headless K8s Service for the StatefulSet]

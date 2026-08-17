@@ -1,8 +1,9 @@
 import axios from 'axios'
 import type { Customer, Part, Invoice, CreateInvoiceData } from '@/types'
 
-// Most reliable fallback for Docker/local development.
-const API_URL = import.meta.env.VITE_API_URL ?? 'http://127.0.0.1:8000'
+// In production, the browser should talk to the public backend hostname.
+// Local development may override this with VITE_API_URL at build time.
+const API_URL = import.meta.env.VITE_API_URL ?? 'https://backend.vihan.store'
 
 export const api = axios.create({
   baseURL: API_URL,
